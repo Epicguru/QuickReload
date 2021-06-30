@@ -14,7 +14,7 @@ namespace QuickReload
 
         private static HashSet<string> watchedDirectories = new HashSet<string>();
         private static List<FileSystemWatcher> watchers = new List<FileSystemWatcher>();
-        private static Dictionary<Mod, List<ReloadAttribute>> methods = new Dictionary<Mod, List<ReloadAttribute>>();
+        private static Dictionary<(Mod mod, Assembly ass), List<ReloadAttribute>> methods = new Dictionary<(Mod mod, Assembly ass), List<ReloadAttribute>>();
         private static Dictionary<MethodInfo, MethodInfo> patches = new Dictionary<MethodInfo, MethodInfo>();
 
         public static void Log(string message)
@@ -44,10 +44,19 @@ namespace QuickReload
             int methodCount = 0;
             int watcherCount = 0;
             methods.Clear();
+            HashSet<ModContentPack> seenContents = new HashSet<ModContentPack>();
             foreach (var mod in LoadedModManager.ModHandles)
             {
                 if (mod?.Content?.assemblies?.loadedAssemblies == null)
                     continue;
+
+                if (seenContents.Contains(mod.Content))
+                {
+                    Log($"Skipping {mod} since content has already been visited.");
+                    continue;
+                }
+
+                seenContents.Add(mod.Content);
 
                 bool hasInMod = false;
 
@@ -63,10 +72,10 @@ namespace QuickReload
 
                             attr.Method = method;
 
-                            if (!methods.TryGetValue(mod, out var list))
+                            if (!methods.TryGetValue((mod, ass), out var list))
                             {
                                 list = new List<ReloadAttribute>();
-                                methods.Add(mod, list);
+                                methods.Add((mod, ass), list);
                             }
                             list.Add(attr);
                             methodCount++;
@@ -83,7 +92,7 @@ namespace QuickReload
                                     continue;
 
                                 watchedDirectories.Add(folder);
-                                var watcher = MakeWatcher(folder, mod);
+                                var watcher = MakeWatcher(folder, mod, ass);
                                 watchers.Add(watcher);
                                 watcherCount++;
                             }
@@ -92,10 +101,10 @@ namespace QuickReload
                 }
             }
 
-            Log($"There are {methods.Count} mods with a total of {methodCount} reloading methods. There are {watcherCount} watchers.");
+            Log($"There are {methods.Count} mods with a total of {methodCount} reloading methods. There are {watcherCount} watchers:\n{string.Join(", ", methods.Keys)}");
         }
 
-        private FileSystemWatcher MakeWatcher(string folder, Mod mod)
+        private FileSystemWatcher MakeWatcher(string folder, Mod mod, Assembly ass)
         {
             var watcher = new FileSystemWatcher(folder);
 
@@ -112,7 +121,7 @@ namespace QuickReload
             {
                 try
                 {
-                    OnAssemblyChanged(mod, args.FullPath);
+                    OnAssemblyChanged(mod, ass, args.FullPath);
                 }
                 catch(Exception e)
                 {
@@ -126,13 +135,28 @@ namespace QuickReload
             return watcher;
         }
 
-        private void OnAssemblyChanged(Mod mod, string newFile)
+        private void OnAssemblyChanged(Mod mod, Assembly ass, string newFile)
         {
             // Find all methods that need patching.
 
             var newAss = Assembly.Load(File.ReadAllBytes(newFile));
+            string simpleName = newAss.GetName().Name;
+            if (simpleName.IndexOf('_') < 0)
+                return;
+            simpleName = simpleName.Substring(0, simpleName.LastIndexOf('_'));
 
-            foreach (var attr in methods[mod])
+            string fileAssName = new FileInfo(newFile).Name;
+            if (fileAssName.IndexOf('_') < 0)
+                return;
+
+            fileAssName = fileAssName.Substring(0, fileAssName.LastIndexOf('_'));
+
+            if (simpleName != fileAssName)
+            {
+                Core.Error($"{simpleName} != {fileAssName}");
+            }
+
+            foreach (var attr in methods[(mod, ass)])
             {
                 blocker ??= GetType().GetMethod("Blocker", BindingFlags.NonPublic | BindingFlags.Static);
                 var existingPatch = patches.TryGetValue(attr.Method);
@@ -158,7 +182,7 @@ namespace QuickReload
                 patches[attr.Method] = replacement;
             }
 
-            Messages.Message($"Reloaded {methods[mod].Count} methods for {mod.Content.Name}", MessageTypeDefOf.PositiveEvent, false);
+            Messages.Message($"Reloaded {methods[(mod, ass)].Count} methods for {mod.Content.Name}", MessageTypeDefOf.PositiveEvent, false);
         }
 
         private MethodInfo GetEquivalentMethod(Assembly ass, MethodInfo original)
@@ -171,7 +195,7 @@ namespace QuickReload
                 args[i] = argsTemp[i].ParameterType;
             Type[] generics = original.IsGenericMethod ? original.GetGenericArguments() : null;
 
-            var method = AccessTools.DeclaredMethod(type, original.Name, args, generics);
+            var method = AccessTools.DeclaredMethod(type, original.Name);
             return method;
         }
 
